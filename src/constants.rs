@@ -1,12 +1,16 @@
-pub(crate) const HASH_LENGTH: usize = 243;
-pub(crate) const STATE_LENGTH: usize = 3 * HASH_LENGTH;
+pub(crate) const CURL_HASH_LENGTH: usize = 243;
+pub(crate) const CURL_STATE_LENGTH: usize = 3 * CURL_HASH_LENGTH;
+pub(crate) const NUM_CURL_ROUNDS: usize = 81;
+pub(crate) const NUM_PRENONCE_ABSORBS: usize =
+    (TRANSACTION_LENGTH - CURL_HASH_LENGTH) / CURL_HASH_LENGTH; // 32
 
-pub(crate) const HI_BITS: u64 = 0xFFFFFFFFFFFFFFFF;
-pub(crate) const LO_BITS: u64 = 0x0000000000000000;
+pub(crate) const BITS1: u64 = 0xFFFFFFFFFFFFFFFF;
+pub(crate) const BITS0: u64 = 0x0000000000000000;
 
 pub(crate) const TRANSACTION_LENGTH: usize = 8019;
 pub(crate) const NONCE_LENGTH: usize = 81;
-pub(crate) const NONCE_START: usize = TRANSACTION_LENGTH - NONCE_LENGTH; //7938
+pub(crate) const NONCE_TX_POS: usize = TRANSACTION_LENGTH - NONCE_LENGTH; // 7938
+pub(crate) const NONCE_ABSORB_POS: usize = CURL_HASH_LENGTH - NONCE_LENGTH; // 162
 
 pub(crate) const L0: u64 = 0xDB6DB6DB6DB6DB6D;
 pub(crate) const H0: u64 = 0xB6DB6DB6DB6DB6DB;
@@ -60,5 +64,3 @@ pub(crate) const INDICES: [isize; 730] = [
     379, 14, 378, 13, 377, 12, 376, 11, 375, 10, 374, 9, 373, 8, 372, 7, 371, 6, 370, 5, 369, 4,
     368, 3, 367, 2, 366, 1, 365, 0,
 ];
-
-pub(crate) const NUM_ROUNDS: usize = 81;
