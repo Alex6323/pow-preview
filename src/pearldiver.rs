@@ -32,7 +32,7 @@ pub struct PearlDiver {
 }
 
 pub struct PearlDiverSearch {
-    diver: PearlDiver,
+    pdiver: PearlDiver,
 }
 
 impl PearlDiver {
@@ -50,7 +50,7 @@ impl PearlDiver {
         assert!(self.state() == PearlDiverState::Created);
 
         //
-        let (h_prestate, l_prestate) = create_bct_prestate(input);
+        let (h_prestate, l_prestate) = create_prestate(input);
 
         // Start searching
         self.set_state(PearlDiverState::Searching);
@@ -240,19 +240,19 @@ fn create_prestate(input: &Input) -> (BCTStateBits, BCTStateBits) {
         );
     }
 
-    for i in 0..NONCE_CURL_POS {
+    for i in 0..NONCE_ABSORB_POS {
         match input[offset] {
             0 => {
-                mid_state_low[i] = HIGH_BITS;
-                mid_state_high[i] = HIGH_BITS;
+                l_prestate[i] = BITS1;
+                h_prestate[i] = BITS1;
             }
             1 => {
-                mid_state_low[i] = LOW_BITS;
-                mid_state_high[i] = HIGH_BITS;
+                l_prestate[i] = BITS0;
+                h_prestate[i] = BITS1;
             }
             _ => {
-                mid_state_low[i] = HIGH_BITS;
-                mid_state_high[i] = LOW_BITS;
+                l_prestate[i] = BITS1;
+                h_prestate[i] = BITS0;
             }
         }
         offset += 1;
@@ -266,6 +266,8 @@ fn create_prestate(input: &Input) -> (BCTStateBits, BCTStateBits) {
     h_prestate[162 + 2] = H2;
     l_prestate[162 + 3] = L3;
     h_prestate[162 + 3] = H3;
+
+    (h_prestate, l_prestate)
 }
 
 unsafe fn transform(
@@ -287,10 +289,10 @@ unsafe fn transform(
             let index1 = INDICES[j + 0];
             let index2 = INDICES[j + 1];
 
-            let alpha = *lsrc.offset(index1);
-            let kappa = *hsrc.offset(index1);
-            let sigma = *lsrc.offset(index2);
-            let gamma = *hsrc.offset(index2);
+            let alpha = *lpre.offset(index1);
+            let kappa = *hpre.offset(index1);
+            let sigma = *lpre.offset(index2);
+            let gamma = *hpre.offset(index2);
 
             let delta = (alpha | !gamma) & (sigma ^ kappa);
 
@@ -298,24 +300,24 @@ unsafe fn transform(
             *hpad.offset(j as isize) = (alpha ^ gamma) | delta;
         }
 
-        lswp = lsrc;
-        hswp = hsrc;
-        lsrc = lpad;
-        hsrc = hpad;
+        lswp = lpre;
+        hswp = hpre;
+        lpre = lpad;
+        hpre = hpad;
         lpad = lswp;
         hpad = hswp;
     }
 
-    // since we don't compute a new state aftere that, we can stop after 'HASH_LENGTH'
+    // since we don't compute a new state after that, we can stop after 'HASH_LENGTH'
     for j in 0..CURL_HASH_LENGTH {
         let index1 = INDICES[j + 0];
         let index2 = INDICES[j + 1];
 
-        let alpha = *lsrc.offset(index1);
-        let kappa = *hsrc.offset(index1);
+        let alpha = *lpre.offset(index1);
+        let kappa = *hpre.offset(index1);
 
-        let sigma = *lsrc.offset(index2);
-        let gamma = *hsrc.offset(index2);
+        let sigma = *lpre.offset(index2);
+        let gamma = *hpre.offset(index2);
 
         let delta = (alpha | !gamma) & (sigma ^ kappa);
 
@@ -324,9 +326,9 @@ unsafe fn transform(
     }
 }
 
-fn check(lo: &BCTLane, hi: &BCTLane, mwm: usize) -> Option<usize> {
-    let mut nonce_probe = HI_BITS;
-    for i in (CURL_HASH_LENGTH - mwm)..CURL_HASH_LENGTH {
+fn check(lo: &BCTStateBits, hi: &BCTStateBits, difficulty: usize) -> Option<usize> {
+    let mut nonce_probe = BITS1;
+    for i in (CURL_HASH_LENGTH - difficulty)..CURL_HASH_LENGTH {
         nonce_probe &= !(lo[i] ^ hi[i]);
         if nonce_probe == 0 {
             return None;
@@ -347,7 +349,7 @@ impl Default for PearlDiver {
         Self {
             num_cores: CoreCount(num_cpus::get()),
             difficulty: Difficulty(14),
-            state: PearlDiverState::Initialized,
+            state: Arc::new(RwLock::new(PearlDiverState::Created)),
         }
     }
 }
