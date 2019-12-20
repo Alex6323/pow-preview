@@ -1,13 +1,52 @@
 use crate::constants::*;
 
 use std::ops::Deref;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::Poll;
 
-// internal conveniance alias
-type BCTStateBits = [u64; CURL_STATE_LENGTH];
+/// A type to encode 64 Curl states in a compressed way that is optimal for parallel processing.
+/// It only requires 2 bits (2^2) to represent a trit, and therefore can store 8 trits per 2 bytes,
+/// or 4 trits per byte, rather than 1 trit per byte as the T1B1 encoding.
+/// (BCT = Binary encoded ternary)
+struct BCTCurlState {
+    hi: [u64; CURL_STATE_LENGTH],
+    lo: [u64; CURL_STATE_LENGTH],
+}
 
-pub struct Input(pub [i8; TRANSACTION_LENGTH]);
+impl BCTCurlState {
+    pub fn new(init_value: u64) -> Self {
+        Self {
+            hi: [init_value; CURL_STATE_LENGTH],
+            lo: [init_value; CURL_STATE_LENGTH],
+        }
+    }
+
+    pub fn set(&mut self, index: usize, hi: u64, lo: u64) {
+        self.hi[index] = hi;
+        self.lo[index] = lo;
+    }
+
+    unsafe fn as_mut_ptr(&self) -> (*mut u64, *mut u64) {
+        (self.hi.as_mut_ptr(), self.lo.as_mut_ptr())
+    }
+}
+
+impl Clone for BCTCurlState {
+    fn clone(&self) -> Self {
+        let mut hi = [0; CURL_STATE_LENGTH];
+        let mut lo = [0; CURL_STATE_LENGTH];
+
+        hi.copy_from_slice(&self.hi);
+        lo.copy_from_slice(&self.lo);
+
+        BCTCurlState { hi, lo }
+    }
+}
+
+/// The balanced trit representation of a serialized transaction.
+pub struct Transaction(pub [i8; TRANSACTION_LENGTH]);
+
+/// The balanced trit representatin of a nonce.
 pub struct Nonce(pub [i8; NONCE_LENGTH]);
 
 #[derive(Clone)]
@@ -29,6 +68,7 @@ pub struct PearlDiver {
     num_cores: CoreCount,
     difficulty: Difficulty,
     state: Arc<RwLock<PearlDiverState>>,
+    nonce: Arc<Mutex<Option<Nonce>>>,
 }
 
 pub struct PearlDiverSearch {
@@ -46,34 +86,34 @@ impl PearlDiver {
     }
 
     /// Searches for a nonce in synchronous/blocking manner.
-    pub fn search_sync(&self, input: &Input) -> Option<Nonce> {
+    pub fn search_sync(&self, transaction: &Transaction) -> Option<Nonce> {
         assert!(self.state() == PearlDiverState::Created);
 
-        //
-        let (h_prestate, l_prestate) = create_prestate(input);
+        // Create the Curl state with all available immutable information (that is everything but the nonce)
+        // We call this the pre-state or in other implementations the mid-state (which is confusing because
+        // we have everything absorbed already except for the nonce).
+        let prestate = create_curl_prestate(transaction);
 
-        // Start searching
         self.set_state(PearlDiverState::Searching);
 
         crossbeam::scope(|scope| {
             for _ in 0..*self.num_cores {
-                scope.spawn(move |_| {
-                    // Copy
-                    let mut hcpy = [0u64; CURL_STATE_LENGTH];
-                    let mut lcpy = [0u64; CURL_STATE_LENGTH];
-                    hcpy.copy_from_slice(&h_prestate);
-                    lcpy.copy_from_slice(&l_prestate);
+                // This 'pre-state' will now be copied for each thread we'll spawn, which then owns the copy and can
+                // mutate it without interference. In terms of performance those are 1-time operations and hence don't
+                // really matter.
+                let prestate_cpy = prestate.clone();
 
+                scope.spawn(move |_| {
                     loop {
                         //
                         unsafe {
-                            transform(&mut lcpy, &mut hcpy);
+                            transform(&mut prestate_cpy);
                         }
 
                         if !running {
                             break;
                         }
-                        if let Some(nonce_index) = check(&lo, &hi, self.difficulty) {
+                        if let Some(nonce_index) = check(&prestate_cpy, self.difficulty) {
                             // nonce found
                             // extract nonce
                             // send it via the channel
@@ -135,16 +175,19 @@ impl PearlDiver {
         *self.state.read().unwrap()
     }
 
-    fn set_state(&mut self, state: PearlDiverState) {
+    pub fn nonce(&self) -> Option<Nonce> {
+        *self.nonce.lock().unwrap()
+    }
+
+    pub fn set_state(&mut self, state: PearlDiverState) {
         *self.state.write().unwrap() = state;
     }
 
-    fn core_loop(
-        lmid: &mut BCTStateBits,
-        hmid: &mut BCTStateBits,
-        mwm: usize,
-        stop_sig: bool,
-    ) -> Option<Nonce> {
+    pub fn set_nonce(&mut self, nonce: Nonce) {
+        (*self.nonce.lock().unwrap()).replace(nonce);
+    }
+
+    fn core_loop(lmid: &mut CSH, hmid: &mut CSH, mwm: usize, stop_sig: bool) -> Option<Nonce> {
         let mut lcpy = [BITS1; CURL_STATE_LENGTH];
         let mut hcpy = [BITS1; CURL_STATE_LENGTH];
 
@@ -173,7 +216,7 @@ impl PearlDiver {
     }
 }
 
-fn base_increment(lmid: &mut BCTStateBits, hmid: &mut BCTStateBits) {
+fn base_increment(lmid: &mut CSH, hmid: &mut CSH) {
     for i in BASE_INCR_START..CORE_INCR_START {
         let lo = lmid[i];
         let hi = hmid[i];
@@ -188,7 +231,7 @@ fn base_increment(lmid: &mut BCTStateBits, hmid: &mut BCTStateBits) {
     }
 }
 
-fn core_increment(lmid: &mut BCTStateBits, hmid: &mut BCTStateBits) -> bool {
+fn core_increment(lmid: &mut CSH, hmid: &mut CSH) -> bool {
     let mut fin = CORE_INCR_START;
 
     for i in CORE_INCR_START..CURL_HASH_LENGTH {
@@ -210,36 +253,27 @@ fn core_increment(lmid: &mut BCTStateBits, hmid: &mut BCTStateBits) -> bool {
 }
 
 /// Create the Curl state up until the last chunk (of size 243) which contains the nonce trits
-fn create_prestate(input: &Input) -> (BCTStateBits, BCTStateBits) {
-    let mut h_prestate = [BITS1; CURL_STATE_LENGTH];
-    let mut l_prestate = [BITS1; CURL_STATE_LENGTH];
-    let mut h_scratchpad = [BITS1; CURL_STATE_LENGTH];
-    let mut l_scratchpad = [BITS1; CURL_STATE_LENGTH];
+fn create_curl_prestate(transaction: &Transaction) -> BCTCurlState {
+    let mut prestate = BCTCurlState::new(BITS1);
+    let mut tmpstate = BCTCurlState::new(BITS1);
 
     let mut offset = 0;
 
-    for _ in 0..NUM_PRENONCE_ABSORBS {
+    // Normal Curl application (except for doing the same 64 times in parallel) for the first 7776 trits
+    for _ in 0..NUM_PRESTATE_ABSORBS {
         for i in 0..CURL_HASH_LENGTH {
-            match input[offset] {
-                1 => {
-                    l_prestate[i] = BITS0;
-                }
-                -1 => {
-                    h_prestate[i] = BITS0;
-                }
+            match (*transaction)[offset] {
+                1 => prestate.set(i, BITS1, BITS0),
+                -1 => prestate.set(i, BITS0, BITS1),
                 _ => (),
             }
             offset += 1;
         }
 
-        transform(
-            &mut h_prestate,
-            &mut l_prestate,
-            &mut h_scratchpad,
-            &mut l_scratchpad,
-        );
+        transform(&mut prestate, &mut tmpstate);
     }
 
+    // Now we have
     for i in 0..NONCE_ABSORB_POS {
         match input[offset] {
             0 => {
@@ -258,24 +292,16 @@ fn create_prestate(input: &Input) -> (BCTStateBits, BCTStateBits) {
         offset += 1;
     }
 
-    l_prestate[162 + 0] = L0;
-    h_prestate[162 + 0] = H0;
-    l_prestate[162 + 1] = L1;
-    h_prestate[162 + 1] = H1;
-    l_prestate[162 + 2] = L2;
-    h_prestate[162 + 2] = H2;
-    l_prestate[162 + 3] = L3;
-    h_prestate[162 + 3] = H3;
+    prestate.set(NONCE_ABSORB_POS + 0, H0, L0);
+    prestate.set(NONCE_ABSORB_POS + 1, H1, L1);
+    prestate.set(NONCE_ABSORB_POS + 2, H2, L2);
+    prestate.set(NONCE_ABSORB_POS + 3, H3, L3);
 
-    (h_prestate, l_prestate)
+    prestate
 }
 
-unsafe fn transform(
-    lpre: &mut BCTStateBits,
-    hpre: &mut BCTStateBits,
-    lpad: &mut BCTStateBits,
-    hpad: &mut BCTStateBits,
-) {
+/// NOTE: To prevent needless allocations we allocate the scratchpad once outside of this function.
+unsafe fn transform(pre: &mut BCTCurlState, pad: &mut BCTCurlState) {
     let mut lpre = lpre.as_mut_ptr();
     let mut hpre = hpre.as_mut_ptr();
     let mut lpad = lpad.as_mut_ptr();
@@ -423,7 +449,7 @@ impl From<usize> for Difficulty {
     }
 }
 
-impl Deref for Input {
+impl Deref for Transaction {
     type Target = [i8; TRANSACTION_LENGTH];
 
     fn deref(&self) -> &Self::Target {

@@ -1,7 +1,7 @@
 pub(crate) const CURL_HASH_LENGTH: usize = 243;
 pub(crate) const CURL_STATE_LENGTH: usize = 3 * CURL_HASH_LENGTH;
 pub(crate) const NUM_CURL_ROUNDS: usize = 81;
-pub(crate) const NUM_PRENONCE_ABSORBS: usize =
+pub(crate) const NUM_PRESTATE_ABSORBS: usize =
     (TRANSACTION_LENGTH - CURL_HASH_LENGTH) / CURL_HASH_LENGTH; // 32
 
 pub(crate) const BITS1: u64 = 0xFFFFFFFFFFFFFFFF;
