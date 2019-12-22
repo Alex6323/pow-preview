@@ -8,12 +8,16 @@ use std::task::Poll;
 /// It only requires 2 bits (2^2) to represent a trit, and therefore can store 8 trits per 2 bytes,
 /// or 4 trits per byte, rather than 1 trit per byte as the T1B1 encoding.
 /// (BCT = Binary encoded ternary)
-struct BCTCurlState {
+struct Curl64State {
     hi: [u64; CURL_STATE_LENGTH],
     lo: [u64; CURL_STATE_LENGTH],
 }
 
-impl BCTCurlState {
+/// A few type aliases to increase code readability.
+type WithCarry = bool;
+type Unfinished = bool;
+
+impl Curl64State {
     pub fn new(init_value: u64) -> Self {
         Self {
             hi: [init_value; CURL_STATE_LENGTH],
@@ -26,12 +30,30 @@ impl BCTCurlState {
         self.lo[index] = lo;
     }
 
+    pub fn get(&mut self, index: usize) -> (u64, u64) {
+        (self.hi[index], self.lo[index])
+    }
+
+    pub fn bit_add(&mut self, index: usize) -> WithCarry {
+        let hi = self.hi[index];
+        let lo = self.lo[index];
+
+        self.hi[index] = lo;
+        self.lo[index] = hi ^ lo;
+
+        hi & !lo != 0
+    }
+
+    pub fn bit_equal(&mut self, index: usize) -> u64 {
+        !(self.lo[index] ^ self.hi[index])
+    }
+
     unsafe fn as_mut_ptr(&self) -> (*mut u64, *mut u64) {
         (self.hi.as_mut_ptr(), self.lo.as_mut_ptr())
     }
 }
 
-impl Clone for BCTCurlState {
+impl Clone for Curl64State {
     fn clone(&self) -> Self {
         let mut hi = [0; CURL_STATE_LENGTH];
         let mut lo = [0; CURL_STATE_LENGTH];
@@ -39,7 +61,7 @@ impl Clone for BCTCurlState {
         hi.copy_from_slice(&self.hi);
         lo.copy_from_slice(&self.lo);
 
-        BCTCurlState { hi, lo }
+        Self { hi, lo }
     }
 }
 
@@ -60,7 +82,7 @@ pub enum PearlDiverState {
     Created,
     Searching,
     Cancelled,
-    Completed,
+    Completed(Option<Nonce>),
 }
 
 #[derive(Clone)]
@@ -101,35 +123,36 @@ impl PearlDiver {
                 // This 'pre-state' will now be copied for each thread we'll spawn, which then owns the copy and can
                 // mutate it without interference. In terms of performance those are 1-time operations and hence don't
                 // really matter.
-                let prestate_cpy = prestate.clone();
+                let mut state_thr = prestate.clone();
 
                 scope.spawn(move |_| {
-                    loop {
-                        //
+                    // We do want to have this allocated only once before the hot-loop
+                    let mut state_tmp = Curl64State::new(BITS1);
+
+                    // This loop should be as optimized as possible
+                    while self.state() == PearlDiverState::Searching {
+                        // Do the final Curl transformation yielding the final Curl state
                         unsafe {
-                            transform(&mut prestate_cpy);
+                            transform(&mut state_thr, &mut state_tmp);
                         }
 
-                        if !running {
-                            break;
-                        }
-                        if let Some(nonce_index) = check(&prestate_cpy, self.difficulty) {
-                            // nonce found
-                            // extract nonce
-                            // send it via the channel
-                            // send kill signal
+                        // check if the nonce satisfies the difficulty setting
+                        if let Some(nonce) = find_nonce(&state_thr, self.difficulty) {
+                            // Immediatedly stop all other threads
+                            self.set_state(PearlDiverState::Completed(Some(nonce)));
                         } else {
-                            core_increment(&mut lo, &mut hi);
+                            // move to the next nonce
+                            if !thread_increment(&mut state_thr) {
+                                self.set_state(PearlDiverState::Completed(None));
+                            }
                         }
                     }
                 });
 
-                base_increment(&mut self.lo, &mut self.hi);
+                base_increment(&mut state_thr);
             }
         })
         .expect("error executing scope");
-
-        let nonce = receiver.recv().expect("error receiving from Nonce channel");
 
         Some(nonce)
     }
@@ -141,29 +164,6 @@ impl PearlDiver {
 
         unimplemented!()
     }
-
-    /*
-    /// Prepare PearlDiver by providing a full Curl state in one-trit-per-byte (T1B1) encoding.
-    /// Note, that for an IOTA transaction (8019 trits) the Nonce is stored in the last 81 trits.
-    fn into_bct(input: &Input) -> ([u64; TRANSACTION_LENGTH], [u64; TRANSACTION_LENGTH]) {
-        let mut hi = [BITS1; TRANSACTION_LENGTH];
-        let mut lo = [BITS1; TRANSACTION_LENGTH];
-
-        for i in 0..CURL_STATE_LENGTH {
-            match input[i] {
-                1 => {
-                    lo[i] = BITS0;
-                }
-                -1 => {
-                    hi[i] = BITS0;
-                }
-                _ => (),
-            }
-        }
-
-        (hi, lo)
-    }
-    */
 
     pub fn cancel(&mut self) {
         if self.state() == PearlDiverState::Searching {
@@ -187,7 +187,7 @@ impl PearlDiver {
         (*self.nonce.lock().unwrap()).replace(nonce);
     }
 
-    fn core_loop(lmid: &mut CSH, hmid: &mut CSH, mwm: usize, stop_sig: bool) -> Option<Nonce> {
+    fn core_loop(prestate: &mut Curl64State, mwm: usize) -> Option<Nonce> {
         let mut lcpy = [BITS1; CURL_STATE_LENGTH];
         let mut hcpy = [BITS1; CURL_STATE_LENGTH];
 
@@ -199,7 +199,7 @@ impl PearlDiver {
                 return None;
             }
 
-            space_exhausted = !core_increment(lmid, hmid);
+            space_exhausted = !thread_increment(lmid, hmid);
 
             lcpy[..].copy_from_slice(&lmid[..]);
             hcpy[..].copy_from_slice(&hmid[..]);
@@ -216,46 +216,53 @@ impl PearlDiver {
     }
 }
 
-fn base_increment(lmid: &mut CSH, hmid: &mut CSH) {
+fn base_increment(prestate: &mut Curl64State) {
     for i in BASE_INCR_START..CORE_INCR_START {
-        let lo = lmid[i];
-        let hi = hmid[i];
-
-        lmid[i] = hi ^ lo;
-        hmid[i] = lo;
-
-        let carry = hi & !lo;
-        if carry == 0 {
+        let with_carry = prestate.bit_add(i);
+        if !with_carry {
             break;
         }
     }
 }
 
-fn core_increment(lmid: &mut CSH, hmid: &mut CSH) -> bool {
-    let mut fin = CORE_INCR_START;
-
+// hot path
+fn thread_increment(prestate: &mut Curl64State) -> Unfinished {
     for i in CORE_INCR_START..CURL_HASH_LENGTH {
-        let lo = lmid[i];
-        let hi = hmid[i];
-
-        lmid[i] = hi ^ lo;
-        hmid[i] = lo;
-
-        let carry = hi & !lo;
-        if carry == 0 {
-            break;
+        let with_carry = prestate.bit_add(i);
+        if !with_carry {
+            return true;
         }
+    }
+    false
+}
 
-        fin += 1;
+/*
+/// Prepare PearlDiver by providing a full Curl state in one-trit-per-byte (T1B1) encoding.
+/// Note, that for an IOTA transaction (8019 trits) the Nonce is stored in the last 81 trits.
+fn into_bct(input: &Input) -> ([u64; TRANSACTION_LENGTH], [u64; TRANSACTION_LENGTH]) {
+    let mut hi = [BITS1; TRANSACTION_LENGTH];
+    let mut lo = [BITS1; TRANSACTION_LENGTH];
+
+    for i in 0..CURL_STATE_LENGTH {
+        match input[i] {
+            1 => {
+                lo[i] = BITS0;
+            }
+            -1 => {
+                hi[i] = BITS0;
+            }
+            _ => (),
+        }
     }
 
-    fin < CURL_HASH_LENGTH
+    (hi, lo)
 }
+*/
 
 /// Create the Curl state up until the last chunk (of size 243) which contains the nonce trits
-fn create_curl_prestate(transaction: &Transaction) -> BCTCurlState {
-    let mut prestate = BCTCurlState::new(BITS1);
-    let mut tmpstate = BCTCurlState::new(BITS1);
+fn create_curl_prestate(transaction: &Transaction) -> Curl64State {
+    let mut prestate = Curl64State::new(BITS1);
+    let mut tmpstate = Curl64State::new(BITS1);
 
     let mut offset = 0;
 
@@ -273,39 +280,39 @@ fn create_curl_prestate(transaction: &Transaction) -> BCTCurlState {
         transform(&mut prestate, &mut tmpstate);
     }
 
-    // Now we have
-    for i in 0..NONCE_ABSORB_POS {
-        match input[offset] {
-            0 => {
-                l_prestate[i] = BITS1;
-                h_prestate[i] = BITS1;
-            }
+    // Now we have to partially absorb the first 162 trits (until the nonce trits start)
+    for i in 0..NONCE_HASH_POS {
+        match (*transaction)[offset] {
             1 => {
-                l_prestate[i] = BITS0;
-                h_prestate[i] = BITS1;
+                prestate.set(i, BITS1, BITS0);
             }
-            _ => {
-                l_prestate[i] = BITS1;
-                h_prestate[i] = BITS0;
+            -1 => {
+                prestate.set(i, BITS0, BITS1);
             }
+            _ => (),
         }
         offset += 1;
     }
 
-    prestate.set(NONCE_ABSORB_POS + 0, H0, L0);
-    prestate.set(NONCE_ABSORB_POS + 1, H1, L1);
-    prestate.set(NONCE_ABSORB_POS + 2, H2, L2);
-    prestate.set(NONCE_ABSORB_POS + 3, H3, L3);
+    // We want each no overlaps when increasing the 64 nonces in parallel. To ensure that
+    // we partition the search space appropriately.
+    // 4 trits (3^4 = 81 possible, only 64 required)
+    // each nonce starts in existence starts out with one out of 64 4-trit sequences
+    // so a first check when hashing an incoming transaction can simply check the first
+    // 4 trits of the nonce, and discard any message that doesn't has one the 64 4-trit
+    // sequences
+    prestate.set(NONCE_HASH_POS + 0, H0, L0);
+    prestate.set(NONCE_HASH_POS + 1, H1, L1);
+    prestate.set(NONCE_HASH_POS + 2, H2, L2);
+    prestate.set(NONCE_HASH_POS + 3, H3, L3);
 
     prestate
 }
 
 /// NOTE: To prevent needless allocations we allocate the scratchpad once outside of this function.
-unsafe fn transform(pre: &mut BCTCurlState, pad: &mut BCTCurlState) {
-    let mut lpre = lpre.as_mut_ptr();
-    let mut hpre = hpre.as_mut_ptr();
-    let mut lpad = lpad.as_mut_ptr();
-    let mut hpad = hpad.as_mut_ptr();
+unsafe fn transform(pre: &mut Curl64State, tmp: &mut Curl64State) {
+    let (hpre, lpre) = pre.as_mut_ptr();
+    let (htmp, ltmp) = tmp.as_mut_ptr();
 
     let mut lswp: *mut u64;
     let mut hswp: *mut u64;
@@ -322,52 +329,71 @@ unsafe fn transform(pre: &mut BCTCurlState, pad: &mut BCTCurlState) {
 
             let delta = (alpha | !gamma) & (sigma ^ kappa);
 
-            *lpad.offset(j as isize) = !delta;
-            *hpad.offset(j as isize) = (alpha ^ gamma) | delta;
+            *ltmp.offset(j as isize) = !delta;
+            *htmp.offset(j as isize) = (alpha ^ gamma) | delta;
         }
 
         lswp = lpre;
         hswp = hpre;
-        lpre = lpad;
-        hpre = hpad;
-        lpad = lswp;
-        hpad = hswp;
+        lpre = ltmp;
+        hpre = htmp;
+        ltmp = lswp;
+        htmp = hswp;
     }
 
-    // since we don't compute a new state after that, we can stop after 'HASH_LENGTH'
+    // since we don't compute a new state after that, we can stop after 'HASH_LENGTH' to save some cycles
     for j in 0..CURL_HASH_LENGTH {
         let index1 = INDICES[j + 0];
         let index2 = INDICES[j + 1];
 
         let alpha = *lpre.offset(index1);
         let kappa = *hpre.offset(index1);
-
         let sigma = *lpre.offset(index2);
         let gamma = *hpre.offset(index2);
 
         let delta = (alpha | !gamma) & (sigma ^ kappa);
 
-        *lpad.offset(j as isize) = !delta;
-        *hpad.offset(j as isize) = (alpha ^ gamma) | delta;
+        *lpre.offset(j as isize) = !delta;
+        *hpre.offset(j as isize) = (alpha ^ gamma) | delta;
     }
 }
 
-fn check(lo: &BCTStateBits, hi: &BCTStateBits, difficulty: usize) -> Option<usize> {
+/// Tries to find a valid nonce, that satiisfies the given difficulty. If successful returns its index.
+fn find_nonce(state: &Curl64State, difficulty: Difficulty) -> Option<Nonce> {
     let mut nonce_probe = BITS1;
-    for i in (CURL_HASH_LENGTH - difficulty)..CURL_HASH_LENGTH {
-        nonce_probe &= !(lo[i] ^ hi[i]);
+
+    for i in (CURL_HASH_LENGTH - *difficulty)..CURL_HASH_LENGTH {
+        nonce_probe &= state.bit_equal(i); //bit_equal means hi=lo=1 (which encodes a zero trit)
+
+        // if 'nonce_test' ever becomes 0, then this means that nonce of the candidates satisfied
+        // the difficulty setting
         if nonce_probe == 0 {
             return None;
         }
     }
 
-    for i in 0..64 {
-        if (nonce_probe >> i) & 0x1 != 0 {
-            return Some(i);
+    // If we haven't returned yet, there is at least one nonce that passes the given difficulty
+    for slot in 0..NUM_SLOTS {
+        if (nonce_probe >> slot) & 1 != 0 {
+            return Some(extract_nonce(&state, slot));
         }
     }
 
     unreachable!()
+}
+
+///
+fn extract_nonce(state: &Curl64State, index: usize) -> Nonce {
+    let mut nonce = [0; NONCE_LENGTH];
+    let mut offset = 0;
+    for i in NONCE_HASH_POS..CURL_HASH_LENGTH {
+        match state.get(i) {
+            (1, 0) => nonce[offset] = 1,
+            (0, 1) => nonce[offset] = -1,
+            (_, _) => (),
+        }
+    }
+    Nonce(nonce)
 }
 
 impl Default for PearlDiver {
@@ -376,6 +402,7 @@ impl Default for PearlDiver {
             num_cores: CoreCount(num_cpus::get()),
             difficulty: Difficulty(14),
             state: Arc::new(RwLock::new(PearlDiverState::Created)),
+            nonce: Arc::new(Mutex::new(None)),
         }
     }
 }

@@ -10,7 +10,10 @@ pub(crate) const BITS0: u64 = 0x0000000000000000;
 pub(crate) const TRANSACTION_LENGTH: usize = 8019;
 pub(crate) const NONCE_LENGTH: usize = 81;
 pub(crate) const NONCE_TX_POS: usize = TRANSACTION_LENGTH - NONCE_LENGTH; // 7938
-pub(crate) const NONCE_ABSORB_POS: usize = CURL_HASH_LENGTH - NONCE_LENGTH; // 162
+pub(crate) const NONCE_HASH_POS: usize = CURL_HASH_LENGTH - NONCE_LENGTH; // 162
+
+/// Represents the number of parallel nonce candidates
+pub(crate) const NUM_SLOTS: usize = 64;
 
 pub(crate) const L0: u64 = 0xDB6DB6DB6DB6DB6D;
 pub(crate) const H0: u64 = 0xB6DB6DB6DB6DB6DB;
@@ -21,7 +24,7 @@ pub(crate) const H2: u64 = 0xFFC01FFFF803FFFF;
 pub(crate) const L3: u64 = 0xFFC0000007FFFFFF;
 pub(crate) const H3: u64 = 0x003FFFFFFFFFFFFF;
 
-pub(crate) const BASE_INCR_START: usize = HASH_LENGTH - NONCE_LENGTH + 4;
+pub(crate) const BASE_INCR_START: usize = CURL_HASH_LENGTH - NONCE_LENGTH + 4;
 pub(crate) const CORE_INCR_START: usize = BASE_INCR_START + 27;
 
 pub(crate) const INDICES: [isize; 730] = [
