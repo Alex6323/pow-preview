@@ -3,38 +3,64 @@ mod curl;
 mod pearldiver;
 mod trits;
 
-use crate::constants::{CURL_HASH_LENGTH, NONCE_START, TRANSACTION_LENGTH};
+use crate::constants::{CURL_HASH_LENGTH, NONCE_HASH_POS, NONCE_TX_POS, TRANSACTION_LENGTH};
 use crate::curl::Curl;
-use crate::pearldiver::Input;
-use crate::pearldiver::PearlDiver;
+use crate::pearldiver::Transaction;
+use crate::pearldiver::{CoreCount, Difficulty};
+use crate::pearldiver::{PearlDiver, PearlDiverState};
 
 fn main() {
     // Create some random trits representing a ternary serialized transaction
-    let mut trits = [0i8; TRANSACTION_LENGTH];
-    trits::random_fill(&mut trits);
+    let mut random_trits = [0i8; TRANSACTION_LENGTH];
+    trits::random_fill(&mut random_trits);
 
-    let input = Input(trits);
+    let transaction = Transaction(random_trits);
+    let is_valid = validity_check(&transaction);
+    println!("is valid: {}", is_valid);
 
-    // Create a default PearlDiver instance, i.e. use all available cores, and difficulty 14
-    let mut pdiver = PearlDiver::default();
+    // Create a default PearlDiver instance, i.e. try to use 4 cores, and difficulty 14
+    let mut pdiver = PearlDiver::new(CoreCount(4), Difficulty(14));
 
-    // Search for a nonce in synchronous/blocking manner
-    if let Ok(Some(nonce)) = pdiver.search_sync(&input) {
-        println!("{:?}", nonce.to_vec());
+    // Search for a nonce in synchronous manner. That means that this call
+    // will block the main thread until `PearlDiver` completes by finding a nonce or
+    // exhausting the whole search space without success.
+    pdiver.search_sync(&transaction);
 
-        // Check, if the nonce is valid
-        let mut tx_trits = [0i8; TRANSACTION_LENGTH];
-        tx_trits[0..NONCE_START].copy_from_slice(&(*input)[..]);
-        tx_trits[NONCE_START..].copy_from_slice(nonce.as_slice());
+    match pdiver.state() {
+        PearlDiverState::Completed(Some(nonce)) => {
+            println!("{:?}", nonce.to_vec());
 
-        let mut hash = [0i8; CURL_HASH_LENGTH];
-        let mut curl = Curl::default();
-        curl.reset();
-        curl.absorb(&tx_trits[..], 0, tx_trits.len());
-        curl.squeeze(&mut hash, 0, CURL_HASH_LENGTH);
+            // Update the transaction with the found nonce
+            let mut powed_trits = [0i8; TRANSACTION_LENGTH];
+            powed_trits[0..NONCE_TX_POS].copy_from_slice(&(*transaction)[..]);
+            powed_trits[NONCE_TX_POS..].copy_from_slice(nonce.as_slice());
 
-        println!("{:?}", hash.to_vec());
-    } else {
-        println!("no nonce found");
+            let transaction = Transaction(powed_trits);
+            assert!(validity_check(&transaction));
+            println!("is valid: {}", is_valid);
+        }
+        PearlDiverState::Completed(None) => {
+            println!("I'm sorry Dave, I'm afraid I can't do that");
+        }
+        _ => unreachable!(),
     }
+}
+
+// Checks, if the given transaction is valid in terms of PoW.
+fn validity_check(tx_trits: &Transaction) -> bool {
+    let mut hash = [0i8; CURL_HASH_LENGTH];
+
+    let mut curl = Curl::default();
+    curl.reset();
+    curl.absorb(&tx_trits[..], 0, tx_trits.len());
+    curl.squeeze(&mut hash, 0, CURL_HASH_LENGTH);
+
+    println!("Hash={:?}", hash.to_vec());
+
+    for i in NONCE_HASH_POS..CURL_HASH_LENGTH {
+        if hash[i] != 0 {
+            return false;
+        }
+    }
+    true
 }

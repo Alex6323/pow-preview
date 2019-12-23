@@ -1,7 +1,7 @@
 use crate::constants::*;
 
 use std::ops::Deref;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::task::Poll;
 
 /// A type to encode 64 Curl states in a compressed way that is optimal for parallel processing.
@@ -15,69 +15,23 @@ struct Curl64State {
 
 /// A few type aliases to increase code readability.
 type WithCarry = bool;
-type Unfinished = bool;
-
-impl Curl64State {
-    pub fn new(init_value: u64) -> Self {
-        Self {
-            hi: [init_value; CURL_STATE_LENGTH],
-            lo: [init_value; CURL_STATE_LENGTH],
-        }
-    }
-
-    pub fn set(&mut self, index: usize, hi: u64, lo: u64) {
-        self.hi[index] = hi;
-        self.lo[index] = lo;
-    }
-
-    pub fn get(&mut self, index: usize) -> (u64, u64) {
-        (self.hi[index], self.lo[index])
-    }
-
-    pub fn bit_add(&mut self, index: usize) -> WithCarry {
-        let hi = self.hi[index];
-        let lo = self.lo[index];
-
-        self.hi[index] = lo;
-        self.lo[index] = hi ^ lo;
-
-        hi & !lo != 0
-    }
-
-    pub fn bit_equal(&mut self, index: usize) -> u64 {
-        !(self.lo[index] ^ self.hi[index])
-    }
-
-    unsafe fn as_mut_ptr(&self) -> (*mut u64, *mut u64) {
-        (self.hi.as_mut_ptr(), self.lo.as_mut_ptr())
-    }
-}
-
-impl Clone for Curl64State {
-    fn clone(&self) -> Self {
-        let mut hi = [0; CURL_STATE_LENGTH];
-        let mut lo = [0; CURL_STATE_LENGTH];
-
-        hi.copy_from_slice(&self.hi);
-        lo.copy_from_slice(&self.lo);
-
-        Self { hi, lo }
-    }
-}
+type Exhausted = bool;
 
 /// The balanced trit representation of a serialized transaction.
 pub struct Transaction(pub [i8; TRANSACTION_LENGTH]);
 
 /// The balanced trit representatin of a nonce.
+#[derive(Copy)]
 pub struct Nonce(pub [i8; NONCE_LENGTH]);
 
+/// New-types that increase readability and type-safety.
 #[derive(Clone)]
-struct CoreCount(usize);
-
+pub struct CoreCount(pub usize);
 #[derive(Clone)]
-struct Difficulty(usize);
+pub struct Difficulty(pub usize);
 
-#[derive(Eq, PartialEq)]
+/// The various states of `PearlDiver`.
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub enum PearlDiverState {
     Created,
     Searching,
@@ -85,14 +39,15 @@ pub enum PearlDiverState {
     Completed(Option<Nonce>),
 }
 
+/// The `PearlDiver` abstraction itself.
 #[derive(Clone)]
 pub struct PearlDiver {
     num_cores: CoreCount,
     difficulty: Difficulty,
     state: Arc<RwLock<PearlDiverState>>,
-    nonce: Arc<Mutex<Option<Nonce>>>,
 }
 
+/// The `PearlDiver` search for a nonce is a computation which yields a result at some point in the future.
 pub struct PearlDiverSearch {
     pdiver: PearlDiver,
 }
@@ -108,60 +63,78 @@ impl PearlDiver {
     }
 
     /// Searches for a nonce in synchronous/blocking manner.
-    pub fn search_sync(&self, transaction: &Transaction) -> Option<Nonce> {
+    /// NOTE: this function has no return value. Once this function returns extract the nonce by querying
+    /// PearlDiver's state.
+    pub fn search_sync(&mut self, transaction: &Transaction) {
         assert!(self.state() == PearlDiverState::Created);
 
         // Create the Curl state with all available immutable information (that is everything but the nonce)
         // We call this the pre-state or in other implementations the mid-state (which is confusing because
         // we have everything absorbed already except for the nonce).
-        let prestate = create_curl_prestate(transaction);
+        let mut prestate = create_curl_prestate(transaction);
 
         self.set_state(PearlDiverState::Searching);
 
+        let num_cores = self.num_cores.clone();
+
         crossbeam::scope(|scope| {
-            for _ in 0..*self.num_cores {
+            for _ in 0..*num_cores {
                 // This 'pre-state' will now be copied for each thread we'll spawn, which then owns the copy and can
-                // mutate it without interference. In terms of performance those are 1-time operations and hence don't
-                // really matter.
+                // mutate it without interference. In terms of performance those are const-time operations and hence
+                // don't really matter.
                 let mut state_thr = prestate.clone();
+                let pdstate = self.state.clone(); // we need to clone the Arc here directly
+                let difficulty = self.difficulty.clone();
 
                 scope.spawn(move |_| {
                     // We do want to have this allocated only once before the hot-loop
                     let mut state_tmp = Curl64State::new(BITS1);
 
-                    // This loop should be as optimized as possible
-                    while self.state() == PearlDiverState::Searching {
+                    // This loop should be as optimized as possible.
+                    // Luckily with an `RwLock` reads can happen in parallel.
+                    while *pdstate.read().unwrap() == PearlDiverState::Searching {
                         // Do the final Curl transformation yielding the final Curl state
                         unsafe {
                             transform(&mut state_thr, &mut state_tmp);
                         }
 
-                        // check if the nonce satisfies the difficulty setting
-                        if let Some(nonce) = find_nonce(&state_thr, self.difficulty) {
-                            // Immediatedly stop all other threads
-                            self.set_state(PearlDiverState::Completed(Some(nonce)));
+                        // Check if the nonce satisfies the difficulty setting
+                        if let Some(nonce) = find_nonce(&state_thr, &difficulty) {
+                            // Signal to all other threads that we (the current thread) won the race
+                            //let mut s = *pdstate.write().unwrap();
+                            //s.set_state(PearlDiverState::Completed(Some(nonce)));
+                            *pdstate.write().unwrap() = PearlDiverState::Completed(Some(nonce));
+                            break;
                         } else {
-                            // move to the next nonce
-                            if !thread_increment(&mut state_thr) {
-                                self.set_state(PearlDiverState::Completed(None));
+                            // Select the next nonce, or if that isn't possible break out of the loop, and end this
+                            // thread.
+                            // NOTE: this extra scope with that additional binding isn't necessary, but good for
+                            // readability and optimized away by the compiler anyways (0-cost).
+                            if {
+                                let exhausted = inner_increment(&mut state_thr);
+                                exhausted
+                            } {
+                                break;
                             }
                         }
                     }
                 });
 
-                base_increment(&mut state_thr);
+                outer_increment(&mut prestate);
             }
         })
-        .expect("error executing scope");
+        .unwrap();
 
-        Some(nonce)
+        // If we reach this point, but the PearlDiver state hasn't been changed to `Completed`, then we exhausted the
+        // whole search space without finding a valid nonce, and we end we switch to `Completed(None)` manually.
+        if self.state() == PearlDiverState::Searching {
+            self.set_state(PearlDiverState::Completed(None));
+        }
     }
 
     pub fn search_async(&mut self) -> Option<PearlDiverSearch> {
         assert!(self.state() == PearlDiverState::Created);
-
         self.set_state(PearlDiverState::Searching);
-
         unimplemented!()
     }
 
@@ -175,48 +148,12 @@ impl PearlDiver {
         *self.state.read().unwrap()
     }
 
-    pub fn nonce(&self) -> Option<Nonce> {
-        *self.nonce.lock().unwrap()
-    }
-
     pub fn set_state(&mut self, state: PearlDiverState) {
         *self.state.write().unwrap() = state;
     }
-
-    pub fn set_nonce(&mut self, nonce: Nonce) {
-        (*self.nonce.lock().unwrap()).replace(nonce);
-    }
-
-    fn core_loop(prestate: &mut Curl64State, mwm: usize) -> Option<Nonce> {
-        let mut lcpy = [BITS1; CURL_STATE_LENGTH];
-        let mut hcpy = [BITS1; CURL_STATE_LENGTH];
-
-        let mut space_exhausted = false;
-
-        loop {
-            // break on search space exhausted or termination signal
-            if stop_sig || space_exhausted {
-                return None;
-            }
-
-            space_exhausted = !thread_increment(lmid, hmid);
-
-            lcpy[..].copy_from_slice(&lmid[..]);
-            hcpy[..].copy_from_slice(&hmid[..]);
-
-            unsafe {
-                transform(&mut lcpy, &mut hcpy);
-            }
-
-            if let Some(nonce_index) = check(&lcpy, &hcpy, mwm) {
-                let nonce = extract(lmid, hmid, nonce_index);
-                return Some(nonce);
-            }
-        }
-    }
 }
 
-fn base_increment(prestate: &mut Curl64State) {
+fn outer_increment(prestate: &mut Curl64State) {
     for i in BASE_INCR_START..CORE_INCR_START {
         let with_carry = prestate.bit_add(i);
         if !with_carry {
@@ -225,39 +162,19 @@ fn base_increment(prestate: &mut Curl64State) {
     }
 }
 
-// hot path
-fn thread_increment(prestate: &mut Curl64State) -> Unfinished {
+fn inner_increment(prestate: &mut Curl64State) -> Exhausted {
+    // we have not exhausted the search space until each add
+    // operation produces a carry
     for i in CORE_INCR_START..CURL_HASH_LENGTH {
-        let with_carry = prestate.bit_add(i);
-        if !with_carry {
-            return true;
+        if {
+            let with_carry = prestate.bit_add(i);
+            !with_carry
+        } {
+            return false;
         }
     }
-    false
+    true
 }
-
-/*
-/// Prepare PearlDiver by providing a full Curl state in one-trit-per-byte (T1B1) encoding.
-/// Note, that for an IOTA transaction (8019 trits) the Nonce is stored in the last 81 trits.
-fn into_bct(input: &Input) -> ([u64; TRANSACTION_LENGTH], [u64; TRANSACTION_LENGTH]) {
-    let mut hi = [BITS1; TRANSACTION_LENGTH];
-    let mut lo = [BITS1; TRANSACTION_LENGTH];
-
-    for i in 0..CURL_STATE_LENGTH {
-        match input[i] {
-            1 => {
-                lo[i] = BITS0;
-            }
-            -1 => {
-                hi[i] = BITS0;
-            }
-            _ => (),
-        }
-    }
-
-    (hi, lo)
-}
-*/
 
 /// Create the Curl state up until the last chunk (of size 243) which contains the nonce trits
 fn create_curl_prestate(transaction: &Transaction) -> Curl64State {
@@ -277,7 +194,9 @@ fn create_curl_prestate(transaction: &Transaction) -> Curl64State {
             offset += 1;
         }
 
-        transform(&mut prestate, &mut tmpstate);
+        unsafe {
+            transform(&mut prestate, &mut tmpstate);
+        }
     }
 
     // Now we have to partially absorb the first 162 trits (until the nonce trits start)
@@ -311,8 +230,8 @@ fn create_curl_prestate(transaction: &Transaction) -> Curl64State {
 
 /// NOTE: To prevent needless allocations we allocate the scratchpad once outside of this function.
 unsafe fn transform(pre: &mut Curl64State, tmp: &mut Curl64State) {
-    let (hpre, lpre) = pre.as_mut_ptr();
-    let (htmp, ltmp) = tmp.as_mut_ptr();
+    let (mut hpre, mut lpre) = pre.as_mut_ptr();
+    let (mut htmp, mut ltmp) = tmp.as_mut_ptr();
 
     let mut lswp: *mut u64;
     let mut hswp: *mut u64;
@@ -359,10 +278,10 @@ unsafe fn transform(pre: &mut Curl64State, tmp: &mut Curl64State) {
 }
 
 /// Tries to find a valid nonce, that satiisfies the given difficulty. If successful returns its index.
-fn find_nonce(state: &Curl64State, difficulty: Difficulty) -> Option<Nonce> {
+fn find_nonce(state: &Curl64State, difficulty: &Difficulty) -> Option<Nonce> {
     let mut nonce_probe = BITS1;
 
-    for i in (CURL_HASH_LENGTH - *difficulty)..CURL_HASH_LENGTH {
+    for i in (CURL_HASH_LENGTH - difficulty.0)..CURL_HASH_LENGTH {
         nonce_probe &= state.bit_equal(i); //bit_equal means hi=lo=1 (which encodes a zero trit)
 
         // if 'nonce_test' ever becomes 0, then this means that nonce of the candidates satisfied
@@ -386,13 +305,19 @@ fn find_nonce(state: &Curl64State, difficulty: Difficulty) -> Option<Nonce> {
 fn extract_nonce(state: &Curl64State, index: usize) -> Nonce {
     let mut nonce = [0; NONCE_LENGTH];
     let mut offset = 0;
+
     for i in NONCE_HASH_POS..CURL_HASH_LENGTH {
-        match state.get(i) {
+        let (hi, lo) = state.get(i);
+        let mask = 1 << index;
+
+        match (hi & mask, lo & mask) {
             (1, 0) => nonce[offset] = 1,
             (0, 1) => nonce[offset] = -1,
             (_, _) => (),
         }
+        offset += 1;
     }
+
     Nonce(nonce)
 }
 
@@ -402,7 +327,6 @@ impl Default for PearlDiver {
             num_cores: CoreCount(num_cpus::get()),
             difficulty: Difficulty(14),
             state: Arc::new(RwLock::new(PearlDiverState::Created)),
-            nonce: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -422,6 +346,64 @@ impl std::future::Future for PearlDiverSearch {
     }
 }
 
+impl Curl64State {
+    pub fn new(init_value: u64) -> Self {
+        Self {
+            hi: [init_value; CURL_STATE_LENGTH],
+            lo: [init_value; CURL_STATE_LENGTH],
+        }
+    }
+
+    pub fn set(&mut self, index: usize, hi: u64, lo: u64) {
+        self.hi[index] = hi;
+        self.lo[index] = lo;
+    }
+
+    pub fn get(&self, index: usize) -> (u64, u64) {
+        (self.hi[index], self.lo[index])
+    }
+
+    pub fn bit_add(&mut self, index: usize) -> WithCarry {
+        let hi = self.hi[index];
+        let lo = self.lo[index];
+
+        self.hi[index] = lo;
+        self.lo[index] = hi ^ lo;
+
+        hi & !lo != 0
+    }
+
+    pub fn bit_equal(&self, index: usize) -> u64 {
+        !(self.hi[index] ^ self.lo[index])
+    }
+
+    // dark art
+    unsafe fn as_mut_ptr(&mut self) -> (*mut u64, *mut u64) {
+        ((&mut self.hi).as_mut_ptr(), (&mut self.lo).as_mut_ptr())
+    }
+}
+
+impl Clone for Curl64State {
+    fn clone(&self) -> Self {
+        let mut hi = [0; CURL_STATE_LENGTH];
+        let mut lo = [0; CURL_STATE_LENGTH];
+
+        hi.copy_from_slice(&self.hi);
+        lo.copy_from_slice(&self.lo);
+
+        Self { hi, lo }
+    }
+}
+
+impl Clone for Nonce {
+    fn clone(&self) -> Self {
+        let mut nonce = [0_i8; NONCE_LENGTH];
+        nonce.copy_from_slice(&self.0);
+
+        Self(nonce)
+    }
+}
+
 impl Nonce {
     pub fn to_vec(&self) -> Vec<i8> {
         self.0.to_vec()
@@ -435,6 +417,13 @@ impl Nonce {
 impl Default for Nonce {
     fn default() -> Self {
         Self([0i8; NONCE_LENGTH])
+    }
+}
+
+impl Eq for Nonce {}
+impl PartialEq for Nonce {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.iter().zip(other.0.iter()).all(|(&i, &j)| i == j)
     }
 }
 
