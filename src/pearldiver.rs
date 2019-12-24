@@ -5,9 +5,8 @@ use std::sync::{Arc, RwLock};
 use std::task::Poll;
 
 /// A type to encode 64 Curl states in a compressed way that is optimal for parallel processing.
-/// It only requires 2 bits (2^2) to represent a trit, and therefore can store 8 trits per 2 bytes,
-/// or 4 trits per byte, rather than 1 trit per byte as the T1B1 encoding.
-/// (BCT = Binary encoded ternary)
+/// It uses only 2 bits intead of 8 to represent a trit as with `i8`, and therefore can store 8
+/// trits per 2 bytes (4 trits per 1 byte). It is often referred to as BCT (Binary encoded ternary).
 struct Curl64State {
     hi: [u64; CURL_STATE_LENGTH],
     lo: [u64; CURL_STATE_LENGTH],
@@ -17,16 +16,21 @@ struct Curl64State {
 type WithCarry = bool;
 type Exhausted = bool;
 
-/// The balanced trit representation of a serialized transaction.
+/// The serialized balanced trit representation of a transaction.
 pub struct Transaction(pub [i8; TRANSACTION_LENGTH]);
 
-/// The balanced trit representatin of a nonce.
+/// The balanced trit representation of a nonce.
 #[derive(Copy)]
 pub struct Nonce(pub [i8; NONCE_LENGTH]);
 
-/// New-types that increase readability and type-safety.
+/// Representation of the number of logical cores.
+/// A new-type to increase readability and type-safety.
 #[derive(Clone)]
 pub struct CoreCount(pub usize);
+
+/// Representation of the minimum-weight-magnitude. I suggest using the term 'Difficulty' as it's
+/// shorter and more approachable to people unfamiliar with IOTA terms.
+/// A new-type to increase readability and type-safety.
 #[derive(Clone)]
 pub struct Difficulty(pub usize);
 
@@ -49,6 +53,7 @@ pub struct PearlDiver {
 
 /// The `PearlDiver` search for a nonce is a computation which yields a result at some point in the future.
 pub struct PearlDiverSearch {
+    prestate: Curl64State,
     pdiver: PearlDiver,
 }
 
@@ -63,14 +68,16 @@ impl PearlDiver {
     }
 
     /// Searches for a nonce in synchronous/blocking manner.
-    /// NOTE: this function has no return value. Once this function returns extract the nonce by querying
-    /// PearlDiver's state.
+    /// NOTE: this function does not return the result (I might change that in the future). The reason is that
+    /// Rust enums can store values, and it made a lot of sense to me to attach the result to the `Completed`
+    /// state. So once this function returns, you have to query `PearlDiver`'s state (see main.rs).
     pub fn search_sync(&mut self, transaction: &Transaction) {
         assert!(self.state() == PearlDiverState::Created);
 
-        // Create the Curl state with all available immutable information (that is everything but the nonce)
-        // We call this the pre-state or in other implementations the mid-state (which is confusing because
-        // we have everything absorbed already except for the nonce).
+        // Create the Curl state with all available immutable information (i.e. everything but the nonce)
+        // I call this the pre-state, while in most (if not all) other implementations this is called the mid-state,
+        // which I find confusing because we're already at the end of absorbing. Rather it's the state previous to
+        // the final state.
         let mut prestate = create_curl_prestate(transaction);
 
         self.set_state(PearlDiverState::Searching);
@@ -80,10 +87,11 @@ impl PearlDiver {
         crossbeam::scope(|scope| {
             for _ in 0..*num_cores {
                 // This 'pre-state' will now be copied for each thread we'll spawn, which then owns the copy and can
-                // mutate it without interference. In terms of performance those are const-time operations and hence
-                // don't really matter.
+                // mutate it without interference. In terms of performance those `clone` invocations are const-time
+                // operations (called once per core) and hence don't really matter.
                 let mut state_thr = prestate.clone();
-                let pdstate = self.state.clone(); // we need to clone the Arc here directly
+
+                let pdstate = self.state.clone();
                 let difficulty = self.difficulty.clone();
 
                 scope.spawn(move |_| {
@@ -91,7 +99,7 @@ impl PearlDiver {
                     let mut state_tmp = Curl64State::new(BITS1);
 
                     // This loop should be as optimized as possible.
-                    // Luckily with an `RwLock` reads can happen in parallel.
+                    // With an `RwLock` multiple readers can acquire the lock (Do not use a Mutex here!).
                     while *pdstate.read().unwrap() == PearlDiverState::Searching {
                         // Do the final Curl transformation yielding the final Curl state
                         unsafe {
@@ -100,9 +108,7 @@ impl PearlDiver {
 
                         // Check if the nonce satisfies the difficulty setting
                         if let Some(nonce) = find_nonce(&state_thr, &difficulty) {
-                            // Signal to all other threads that we (the current thread) won the race
-                            //let mut s = *pdstate.write().unwrap();
-                            //s.set_state(PearlDiverState::Completed(Some(nonce)));
+                            // Signal to all other threads that we (the current thread) won the race for finding a nonce
                             *pdstate.write().unwrap() = PearlDiverState::Completed(Some(nonce));
                             break;
                         } else {
@@ -125,17 +131,22 @@ impl PearlDiver {
         })
         .unwrap();
 
-        // If we reach this point, but the PearlDiver state hasn't been changed to `Completed`, then we exhausted the
-        // whole search space without finding a valid nonce, and we end we switch to `Completed(None)` manually.
+        // If we reach this point, but the PearlDiver state hasn't been changed to `Completed`, then we have searched
+        // the whole space without finding a valid nonce, and we have to switch the state to `Completed(None)` manually.
         if self.state() == PearlDiverState::Searching {
             self.set_state(PearlDiverState::Completed(None));
         }
     }
 
-    pub fn search_async(&mut self) -> Option<PearlDiverSearch> {
+    pub fn search_async(&mut self, transaction: &Transaction) -> PearlDiverSearch {
         assert!(self.state() == PearlDiverState::Created);
-        self.set_state(PearlDiverState::Searching);
-        unimplemented!()
+
+        let prestate = create_curl_prestate(transaction);
+
+        PearlDiverSearch {
+            prestate,
+            pdiver: self.clone(),
+        }
     }
 
     pub fn cancel(&mut self) {
@@ -176,7 +187,7 @@ fn inner_increment(prestate: &mut Curl64State) -> Exhausted {
     true
 }
 
-/// Create the Curl state up until the last chunk (of size 243) which contains the nonce trits
+/// Create the Curl state as before absorbing the nonce trits (the last 81 trits in a transaction)
 fn create_curl_prestate(transaction: &Transaction) -> Curl64State {
     let mut prestate = Curl64State::new(BITS1);
     let mut tmpstate = Curl64State::new(BITS1);
@@ -202,24 +213,17 @@ fn create_curl_prestate(transaction: &Transaction) -> Curl64State {
     // Now we have to partially absorb the first 162 trits (until the nonce trits start)
     for i in 0..NONCE_HASH_POS {
         match (*transaction)[offset] {
-            1 => {
-                prestate.set(i, BITS1, BITS0);
-            }
-            -1 => {
-                prestate.set(i, BITS0, BITS1);
-            }
+            1 => prestate.set(i, BITS1, BITS0),
+            -1 => prestate.set(i, BITS0, BITS1),
             _ => (),
         }
         offset += 1;
     }
 
-    // We want each no overlaps when increasing the 64 nonces in parallel. To ensure that
-    // we partition the search space appropriately.
-    // 4 trits (3^4 = 81 possible, only 64 required)
-    // each nonce starts in existence starts out with one out of 64 4-trit sequences
-    // so a first check when hashing an incoming transaction can simply check the first
-    // 4 trits of the nonce, and discard any message that doesn't has one the 64 4-trit
-    // sequences
+    // Since we don't want overlaps when increasing the 64 nonces in parallel, we partition the search space
+    // accordingly. The idea here is to partition the search space into 64 sub-spaces. To do that we need at
+    // atl least 4 trits (allows for a maximum of 3^4 = 81 possible partitons). That way we can ensure that
+    // the bitwise increments will never produce overlaps.
     prestate.set(NONCE_HASH_POS + 0, H0, L0);
     prestate.set(NONCE_HASH_POS + 1, H1, L1);
     prestate.set(NONCE_HASH_POS + 2, H2, L2);
@@ -228,7 +232,8 @@ fn create_curl_prestate(transaction: &Transaction) -> Curl64State {
     prestate
 }
 
-/// NOTE: To prevent needless allocations we allocate the scratchpad once outside of this function.
+/// NOTE: To prevent unnecessary allocations we instantiate the scratchpad (tmp) only once per core outside of
+/// this function.
 unsafe fn transform(pre: &mut Curl64State, tmp: &mut Curl64State) {
     let (mut hpre, mut lpre) = pre.as_mut_ptr();
     let (mut htmp, mut ltmp) = tmp.as_mut_ptr();
@@ -260,7 +265,7 @@ unsafe fn transform(pre: &mut Curl64State, tmp: &mut Curl64State) {
         htmp = hswp;
     }
 
-    // since we don't compute a new state after that, we can stop after 'HASH_LENGTH' to save some cycles
+    // NOTE: Since we don't compute a new state after that, we stop after 'HASH_LENGTH'.
     for j in 0..CURL_HASH_LENGTH {
         let index1 = INDICES[j + 0];
         let index2 = INDICES[j + 1];
@@ -277,23 +282,26 @@ unsafe fn transform(pre: &mut Curl64State, tmp: &mut Curl64State) {
     }
 }
 
-/// Tries to find a valid nonce, that satiisfies the given difficulty. If successful returns its index.
+/// Tries to find a valid nonce, that satisfies the given difficulty. If successful returns `Some(nonce)`,
+/// otherwise `None`.
 fn find_nonce(state: &Curl64State, difficulty: &Difficulty) -> Option<Nonce> {
-    let mut nonce_probe = BITS1;
+    //
+    let mut nonce_test = BITS1;
 
     for i in (CURL_HASH_LENGTH - difficulty.0)..CURL_HASH_LENGTH {
-        nonce_probe &= state.bit_equal(i); //bit_equal means hi=lo=1 (which encodes a zero trit)
+        nonce_test &= state.bit_equal(i);
 
-        // if 'nonce_test' ever becomes 0, then this means that nonce of the candidates satisfied
+        // If 'nonce_test' ever becomes 0, then this means that none of the current nonce candidates satisfied
         // the difficulty setting
-        if nonce_probe == 0 {
+        if nonce_test == 0 {
             return None;
         }
     }
 
-    // If we haven't returned yet, there is at least one nonce that passes the given difficulty
+    // If we haven't returned yet, there is at least one nonce that satisfies the given difficulty. Now we
+    // need to find its index/slot. We will return the first we find, but there could be multiple.
     for slot in 0..NUM_SLOTS {
-        if (nonce_probe >> slot) & 1 != 0 {
+        if (nonce_test >> slot) & 1 != 0 {
             return Some(extract_nonce(&state, slot));
         }
     }
@@ -301,16 +309,16 @@ fn find_nonce(state: &Curl64State, difficulty: &Difficulty) -> Option<Nonce> {
     unreachable!()
 }
 
-///
-fn extract_nonce(state: &Curl64State, index: usize) -> Nonce {
+/// Extracts the nonce from the final Curl state and the given slot index.
+fn extract_nonce(state: &Curl64State, slot: usize) -> Nonce {
     let mut nonce = [0; NONCE_LENGTH];
     let mut offset = 0;
+    let slotmask = 1 << slot;
 
     for i in NONCE_HASH_POS..CURL_HASH_LENGTH {
         let (hi, lo) = state.get(i);
-        let mask = 1 << index;
 
-        match (hi & mask, lo & mask) {
+        match (hi & slotmask, lo & slotmask) {
             (1, 0) => nonce[offset] = 1,
             (0, 1) => nonce[offset] = -1,
             (_, _) => (),
@@ -370,9 +378,12 @@ impl Curl64State {
         self.hi[index] = lo;
         self.lo[index] = hi ^ lo;
 
-        hi & !lo != 0
+        (hi & !lo) != 0
     }
 
+    /// Returns a bit-field (u64) that has its bits set, if the corresponding hi and lo bits are equal. For valid
+    /// input this is only the case if hi=lo=1, i.e. a zero trit. So this method applied to BCT determines whether
+    /// (hi, lo) represent a zero trit at the given index.
     pub fn bit_equal(&self, index: usize) -> u64 {
         !(self.hi[index] ^ self.lo[index])
     }
@@ -471,4 +482,9 @@ impl Deref for Transaction {
     fn deref(&self) -> &Self::Target {
         &self.0
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 }

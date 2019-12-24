@@ -9,17 +9,19 @@ use crate::pearldiver::Transaction;
 use crate::pearldiver::{CoreCount, Difficulty};
 use crate::pearldiver::{PearlDiver, PearlDiverState};
 
+const DIFFICULTY: usize = 14;
+
 fn main() {
     // Create some random trits representing a ternary serialized transaction
     let mut random_trits = [0i8; TRANSACTION_LENGTH];
     trits::random_fill(&mut random_trits);
 
     let transaction = Transaction(random_trits);
-    let is_valid = validity_check(&transaction);
+    let is_valid = validity_check(&transaction, Difficulty(DIFFICULTY));
     println!("is valid: {}", is_valid);
 
     // Create a default PearlDiver instance, i.e. try to use 4 cores, and difficulty 14
-    let mut pdiver = PearlDiver::new(CoreCount(4), Difficulty(14));
+    let mut pdiver = PearlDiver::new(CoreCount(4), Difficulty(DIFFICULTY));
 
     // Search for a nonce in synchronous manner. That means that this call
     // will block the main thread until `PearlDiver` completes by finding a nonce or
@@ -36,7 +38,7 @@ fn main() {
             powed_trits[NONCE_TX_POS..].copy_from_slice(nonce.as_slice());
 
             let transaction = Transaction(powed_trits);
-            assert!(validity_check(&transaction));
+            assert!(validity_check(&transaction, Difficulty(DIFFICULTY)));
             println!("is valid: {}", is_valid);
         }
         PearlDiverState::Completed(None) => {
@@ -44,10 +46,14 @@ fn main() {
         }
         _ => unreachable!(),
     }
+
+    // Now for the asynchronous execution:
+    // What happens now is that instead of blocking we'll receive a `PearlDiverSearch` future immediatedly.
+    let search = pdiver.search_async(&transaction);
 }
 
 // Checks, if the given transaction is valid in terms of PoW.
-fn validity_check(tx_trits: &Transaction) -> bool {
+fn validity_check(tx_trits: &Transaction, difficulty: Difficulty) -> bool {
     let mut hash = [0i8; CURL_HASH_LENGTH];
 
     let mut curl = Curl::default();
@@ -57,7 +63,7 @@ fn validity_check(tx_trits: &Transaction) -> bool {
 
     println!("Hash={:?}", hash.to_vec());
 
-    for i in NONCE_HASH_POS..CURL_HASH_LENGTH {
+    for i in (CURL_HASH_LENGTH - *difficulty)..CURL_HASH_LENGTH {
         if hash[i] != 0 {
             return false;
         }
